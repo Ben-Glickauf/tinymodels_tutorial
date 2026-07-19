@@ -784,3 +784,600 @@ rf_testing_pred |>                   # test set predictions
 ```
 
 The performance metrics from the test set are much closer to the performance metrics computed using resampling than our first (“bad idea”) attempt. Resampling allows us to simulate how well our model will perform on new data, and the test set acts as the final, unbiased check for our model’s performance.
+
+# Tune model parameters
+
+## Introduction
+
+Some model parameters cannot be learned directly from a data set during model training; these kinds of parameters are called **hyperparameters**. Some examples of hyperparameters include the number of predictors that are sampled at splits in a tree-based model (we call this `mtry` in tidymodels) or the learning rate in a boosted tree model (we call this `learn_rate`).
+
+Instead of learning these kinds of hyperparameters during model training, we can *estimate* the best values for these values by training many models on resampled data sets and exploring how well all these models perform. This process is called **tuning**.
+
+```{r}
+library(tidymodels)  # for the tune package, along with the rest of tidymodels
+
+# Helper packages
+library(rpart.plot)  # for visualizing a decision tree
+#library(vip)         # for variable importance plots (won't load)
+```
+
+## The cell image data, revisited
+
+In our previous [*Evaluate your model with resampling*](https://www.tidymodels.org/start/resampling/) article, we introduced a data set of images of cells that were labeled by experts as well-segmented (`WS`) or poorly segmented (`PS`). We trained a [random forest model](https://www.tidymodels.org/start/resampling/#modeling) to predict which images are segmented well vs. poorly, so that a biologist could filter out poorly segmented cell images in their analysis. We used [resampling](https://www.tidymodels.org/start/resampling/#resampling) to estimate the performance of our model on this data.
+
+```{r}
+data(cells, package = "modeldata")
+cells
+```
+
+## Predicting image segmentation, but better
+
+Random forest models are a tree-based ensemble method, and typically perform well with [default hyperparameters](https://bradleyboehmke.github.io/HOML/random-forest.html#out-of-the-box-performance). However, the accuracy of some other tree-based models, such as [boosted tree models](https://en.wikipedia.org/wiki/Gradient_boosting#Gradient_tree_boosting) or [decision tree models](https://en.wikipedia.org/wiki/Decision_tree), can be sensitive to the values of hyperparameters. In this article, we will train a **decision tree** model. There are several hyperparameters for decision tree models that can be tuned for better performance. Let’s explore:
+
+- the complexity parameter (which we call `cost_complexity` in tidymodels) for the tree, and
+
+- the maximum `tree_depth`.
+
+Tuning these hyperparameters can improve model performance because decision tree models are prone to [overfitting](https://bookdown.org/max/FES/important-concepts.html#overfitting). This happens because single tree models tend to fit the training data *too well* — so well, in fact, that they over-learn patterns present in the training data that end up being detrimental when predicting new data.
+
+Tuning the value of `cost_complexity` helps by [pruning](https://bradleyboehmke.github.io/HOML/DT.html#pruning) back our tree. It adds a cost, or penalty, to error rates of more complex trees; a cost closer to zero decreases the number tree nodes pruned and is more likely to result in an overfit tree. However, a high cost increases the number of tree nodes pruned and can result in the opposite problem—an underfit tree. Tuning `tree_depth`, on the other hand, helps by [stopping](https://bradleyboehmke.github.io/HOML/DT.html#early-stopping) our tree from growing after it reaches a certain depth. We want to tune these hyperparameters to find what those two values should be for our model to do the best job predicting image segmentation.
+
+Before we start the tuning process, we split our data into training and testing sets, just like when we trained the model with one default set of hyperparameters. As [before](https://www.tidymodels.org/start/resampling/), we can use `strata = class` if we want our training and testing sets to be created using stratified sampling so that both have the same proportion of both kinds of segmentation.
+
+```{r}
+set.seed(123)
+cell_split <- initial_split(cells |> select(-case), 
+                            strata = class)
+cell_train <- training(cell_split)
+cell_test  <- testing(cell_split)
+```
+
+We use the training data for tuning the model.
+
+## Tuning hyperparameters
+
+Let’s start with the parsnip package, using a [`decision_tree()`](https://parsnip.tidymodels.org/reference/decision_tree.html) model with the [rpart](https://cran.r-project.org/web/packages/rpart/index.html) engine. To tune the decision tree hyperparameters `cost_complexity` and `tree_depth`, we create a model specification that identifies which hyperparameters we plan to tune.
+
+```{r}
+tune_spec <- 
+  decision_tree(
+    cost_complexity = tune(),
+    tree_depth = tune()
+  ) |> 
+  set_engine("rpart") |> 
+  set_mode("classification")
+
+tune_spec
+```
+
+Think of [`tune()`](https://hardhat.tidymodels.org/reference/tune.html) here as a placeholder. After the tuning process, we will select a single numeric value for each of these hyperparameters. For now, we specify our parsnip model object and identify the hyperparameters we will [`tune()`](https://hardhat.tidymodels.org/reference/tune.html).
+
+We can’t train this specification on a single data set (such as the entire training set) and learn what the hyperparameter values should be, but we *can* train many models using resampled data and see which models turn out best. We can create a regular grid of values to try using some convenience functions for each hyperparameter:
+
+```{r}
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          levels = 5)
+```
+
+The function [`grid_regular()`](https://dials.tidymodels.org/reference/grid_regular.html) is from the [dials](https://dials.tidymodels.org/) package. It chooses sensible values to try for each hyperparameter; here, we asked for 5 of each. Since we have two to tune, [`grid_regular()`](https://dials.tidymodels.org/reference/grid_regular.html) returns 5 5 = 25 different possible tuning combinations to try in a tidy tibble format.
+
+```{r}
+tree_grid
+```
+
+Here, you can see all 5 values of `cost_complexity` ranging up to 0.1. These values get repeated for each of the 5 values of `tree_depth`:
+
+```{r}
+tree_grid |> 
+  count(tree_depth)
+```
+
+Armed with our grid filled with 25 candidate decision tree models, let’s create [cross-validation folds](https://www.tidymodels.org/start/resampling/) for tuning:
+
+```{r}
+set.seed(234)
+cell_folds <- vfold_cv(cell_train)
+```
+
+Tuning in `tidymodels` requires a `resampled` object created with the [rsample](https://rsample.tidymodels.org/) package.
+
+## Model tuning with a grid
+
+We are ready to tune! Let’s use [`tune_grid()`](https://tune.tidymodels.org/reference/tune_grid.html) to fit models at all the different values we chose for each tuned hyperparameter. There are several options for building the object for tuning:
+
+- Tune a model specification along with a recipe or model, or
+
+- Tune a [`workflow()`](https://workflows.tidymodels.org/) that bundles together a model specification and a recipe or model preprocessor.
+
+Here we use a [`workflow()`](https://workflows.tidymodels.org/reference/workflow.html) with a straightforward formula; if this model required more involved data preprocessing, we could use [`add_recipe()`](https://workflows.tidymodels.org/reference/add_recipe.html) instead of [`add_formula()`](https://workflows.tidymodels.org/reference/add_formula.html).
+
+```{r}
+set.seed(345)
+
+tree_wf <- workflow() |>
+  add_model(tune_spec) |>
+  add_formula(class ~ .)
+
+tree_res <- 
+  tree_wf |> 
+  tune_grid(
+    resamples = cell_folds,
+    grid = tree_grid
+  )
+
+tree_res
+```
+
+The function [`collect_metrics()`](https://tune.tidymodels.org/reference/collect_predictions.html) gives us a tidy tibble with all the results. We had 25 candidate models and two metrics, `accuracy` and `roc_auc`, and we get a row for each `.metric` and model.
+
+```{r}
+tree_res |> 
+  collect_metrics()
+```
+
+Plot these results:
+
+```{r}
+tree_res |>
+  collect_metrics() |>
+  mutate(tree_depth = factor(tree_depth)) |>
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(linewidth = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+We can see that our “stubbiest” tree, with a depth of 1, is the worst model according to both metrics and across all candidate values of `cost_complexity`. Our deepest tree, with a depth of 15, did better. However, the best tree seems to be between these values with a tree depth of 4. The [`show_best()`](https://tune.tidymodels.org/reference/show_best.html) function shows us the top 5 candidate models by default:
+
+```{r}
+tree_res |>
+  show_best(metric = "accuracy")
+```
+
+We can also use the [`select_best()`](https://tune.tidymodels.org/reference/show_best.html) function to pull out the single set of hyperparameter values for our best decision tree model:
+
+```{r}
+best_tree <- tree_res |>
+  select_best(metric = "accuracy")
+
+best_tree
+```
+
+These are the values for `tree_depth` and `cost_complexity` that maximize accuracy in this data set of cell images.
+
+## Finalizing our model
+
+We can update (or “finalize”) our workflow object `tree_wf` with the values from [`select_best()`](https://tune.tidymodels.org/reference/show_best.html).
+
+```{r}
+final_wf <- 
+  tree_wf |> 
+  finalize_workflow(best_tree)
+
+final_wf
+```
+
+Our tuning is done!
+
+### The last fit
+
+Finally, let’s fit this final model to the training data and use our test data to estimate the model performance we expect to see with new data. We can use the function [`last_fit()`](https://tune.tidymodels.org/reference/last_fit.html) with our finalized model; this function *fits* the finalized model on the full training data set and *evaluates* the finalized model on the testing data.
+
+```{r}
+final_fit <- 
+  final_wf |>
+  last_fit(cell_split) 
+
+final_fit |>
+  collect_metrics()
+```
+
+```{r}
+final_fit |>
+  collect_predictions() |> 
+  roc_curve(class, .pred_PS) |> 
+  autoplot()
+```
+
+The performance metrics from the test set indicate that we did not overfit during our tuning procedure.
+
+The `final_fit` object contains a finalized, fitted workflow that you can use for predicting on new data or further understanding the results. You may want to extract this object, using [one of the `extract_` helper functions](https://tune.tidymodels.org/reference/extract-tune.html).
+
+```{r}
+final_tree <- extract_workflow(final_fit)
+final_tree
+```
+
+We can create a visualization of the decision tree using another helper function to extract the underlying engine-specific fit.
+
+```{r}
+final_tree |>
+  extract_fit_engine() |>
+  rpart.plot(roundint = FALSE)
+```
+
+Perhaps we would also like to understand what variables are important in this final model. We can use the [vip](https://koalaverse.github.io/vip/) package to estimate variable importance [based on the model’s structure](https://koalaverse.github.io/vip/reference/vi_model.html#details).
+
+```{r eval = FALSE}
+# doesn't run, wip packae won't load
+library(vip)
+
+final_tree |> 
+  extract_fit_parsnip() |> 
+  vip()
+```
+
+# Case Study
+
+## [Introduction](https://www.tidymodels.org/start/models/#intro)
+
+Let's put everything we learned from each of the previous [Get Started](https://www.tidymodels.org/start/) articles together and build a predictive model from beginning to end with data on hotel stays.
+
+Load necessary packages:
+
+```{r}
+library(tidymodels)  
+
+# Helper packages
+library(readr)       # for importing data
+library(vip)         # for variable importance plots
+```
+
+## [The Hotel Bookings Data](https://www.tidymodels.org/start/case-study/#data)
+
+Let's read the hotel data into R and randomly select 30% of the rows in the data set to avoid long computation times later on.
+
+Note that your results will differ from the original article, since you are only using 30% of the data.
+
+```{r}
+# Fix the random numbers by setting the seed 
+# This enables the analysis to be reproducible when random numbers are used
+set.seed(123)
+
+hotels <- 
+  read_csv('https://tidymodels.org/start/case-study/hotels.csv') %>%
+  mutate_if(is.character, as.factor) %>%
+  # randomly select rows
+  slice_sample(prop = 0.30)
+
+
+dim(hotels)
+glimpse(hotels)
+```
+
+Let's look at proportions of hotel stays that include children and/or babies:
+
+```{r}
+hotels %>% 
+  count(children) %>% 
+  mutate(prop = n/sum(n))
+```
+
+## [A first model: penalized logistic regression](https://www.tidymodels.org/start/case-study/#first-model)
+
+Do you recall [Evaluate your model with resampling](/start/resampling/#data-split) article for data splitting?
+
+Let's reserve 25% of the `hotels` data for the test set:
+
+```{r}
+set.seed(123)
+splits      <- initial_split(hotels, strata = children)
+
+hotel_other <- training(splits)
+hotel_test  <- testing(splits)
+
+# training set proportions by children
+hotel_other %>% 
+  count(children) %>% 
+  mutate(prop = n/sum(n))
+
+# test set proportions by children
+hotel_test  %>% 
+  count(children) %>% 
+  mutate(prop = n/sum(n))
+```
+
+Now let's reserve another 20% of the `hotel_other` for our validation set.
+
+```{r}
+set.seed(234)
+val_set <- validation_split(hotel_other, 
+                            strata = children, 
+                            prop = 0.80)
+val_set
+```
+
+### Build the model
+
+Let's specify a penalized logistic regression model using the lasso method. Note that we define `penalty = tune()` so we can tune it in the next steps, and since we are using lasso method, we set `mixture = 1`.
+
+```{r}
+lr_mod <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+```
+
+For more details try typing `?logistic_reg` on the console.
+
+### Create the recipe
+
+Remember the second article [Preprocess your data with recipes](https://www.tidymodels.org/start/recipes)?
+
+Let's preprocess the data by creating a recipe:
+
+```{r}
+holidays <- c("AllSouls", "AshWednesday", "ChristmasEve", "Easter", 
+              "ChristmasDay", "GoodFriday", "NewYearsDay", "PalmSunday")
+
+lr_recipe <- 
+  recipe(children ~ ., data = hotel_other) %>% 
+  step_date(arrival_date) %>% 
+  step_holiday(arrival_date, holidays = holidays) %>% 
+  step_rm(arrival_date) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+```
+
+### Create the workflow
+
+Let's bundle the model and recipe into a single `workflow()`:
+
+```{r}
+lr_workflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_recipe)
+```
+
+### Create the grid for tuning
+
+We can now tune our model, similar to what is shown in the previous article [Tune model parameters](https://www.tidymodels.org/start/tuning). Let's create a grid with 30 values for the hyperparameter we would like to tune:
+
+```{r}
+lr_reg_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+
+lr_reg_grid %>% top_n(-5) # lowest penalty values
+lr_reg_grid %>% top_n(5)  # highest penalty values
+```
+
+### Train and tune the model
+
+Let's train all these logistic regression models with 30 different hyperparameter values. We provide the validation set `val_set`, so model diagnostics computed on `val_set` will be available after the fit.
+
+```{r}
+lr_res <- 
+  lr_workflow %>% 
+  tune_grid(val_set,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = TRUE, verbose = TRUE),
+            metrics = metric_set(roc_auc))
+
+lr_res
+```
+
+Now visualize the validation set metrics by plotting the area under the ROC curve against the range of penalty values:
+
+```{r}
+lr_plot <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+
+lr_plot 
+```
+
+Get the best values for this hyperparameter:
+
+```{r}
+top_models <-
+  lr_res %>% 
+  show_best("roc_auc", n = 15) %>% 
+  arrange(penalty) 
+top_models
+```
+
+Let's pick candidate model 12 with a penalty value of `0.00137`:
+
+Note that because you are using less data, your mean ROC AUC will be slightly lower than what's shown in the article.
+
+```{r}
+lr_best <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  arrange(penalty) %>% 
+  slice(12)
+lr_best
+```
+
+And visualize the validation set ROC curve:
+
+```{r}
+lr_auc <- 
+  lr_res %>% 
+  collect_predictions(parameters = lr_best) %>% 
+  roc_curve(children, .pred_children) %>% 
+  mutate(model = "Logistic Regression")
+
+autoplot(lr_auc)
+```
+
+## [A second model: tree-based ensemble](https://www.tidymodels.org/start/case-study/#second-model)
+
+Let's try to improve our prediction performance by using a random forest model (model *type*), which we also explored in the [Evaluate your model with resampling](https://www.tidymodels.org/start/resampling/) article.
+
+Check number of cores to work with:
+
+```{r}
+cores <- parallel::detectCores()
+cores
+```
+
+Set model specification and provide number of cores for parallelization while tuning.
+
+```{r}
+rf_mod <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification")
+```
+
+### Create the recipe and workflow
+
+Let's create the recipe for the model.
+
+```{r}
+rf_recipe <- 
+  recipe(children ~ ., data = hotel_other) %>% 
+  step_date(arrival_date) %>% 
+  step_holiday(arrival_date) %>% 
+  step_rm(arrival_date) 
+```
+
+Then bundle it with the model specification:
+
+```{r}
+rf_workflow <- 
+  workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_recipe)
+```
+
+### Train and tune the model
+
+When we set up our parsnip model, we chose two hyperparameters for tuning:
+
+```{r}
+rf_mod
+
+# show what will be tuned
+rf_mod %>%    
+  parameters()  
+```
+
+We will use a space-filling design to tune with 12 candidate models (instead of 25, to reduce computation time).
+
+Be patient here! Computing these results will take several minutes to complete if you are using the default RStudio Cloud resources (1 GB memory, 1 CPU).
+
+```{r}
+set.seed(345)
+rf_res <- 
+  rf_workflow %>% 
+  tune_grid(val_set,
+            grid = 12,
+            control = control_grid(save_pred = TRUE, verbose = TRUE),
+            metrics = metric_set(roc_auc))
+```
+
+Here are our top 5 random forest models, out of the 12 candidates:
+
+Note that your results will be different and your accuracy will take a small hit since you are using less data (only 25% of the whole data set) and setting up a smaller grid to tune model hyperparameters.
+
+```{r}
+rf_res %>% 
+  show_best(metric = "roc_auc")
+```
+
+But we're already getting much better results than our penalized logistic regression!
+
+Let's plot the results:
+
+```{r}
+autoplot(rf_res)
+```
+
+Let's select the best model according to the ROC AUC metric. Our final tuning parameter values are:
+
+```{r rf-best}
+rf_best <- 
+  rf_res %>% 
+  select_best(metric = "roc_auc")
+rf_best
+```
+
+Collect predictions for the best model: Note that we simply provide our best model's parameter values `rf_best` to subset it from a whole list of tuned models.
+
+```{r}
+rf_res %>% 
+  collect_predictions()
+
+rf_auc <- 
+  rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(children, .pred_children) %>% 
+  mutate(model = "Random Forest")
+```
+
+Now, we can compare the validation set ROC curves for our top penalized logistic regression model and random forest model:
+
+```{r}
+bind_rows(rf_auc, lr_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+```
+
+The random forest is uniformly better across event probability thresholds.
+
+## [The last fit](https://www.tidymodels.org/start/case-study/#last-fit)
+
+Let's evaluate the model performance one last time with the held-out test set. We'll start by building our parsnip model object again from scratch with our best hyperparameter values from our random forest model:
+
+```{r}
+# the last model
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 7, trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores, importance = "impurity") %>% 
+  set_mode("classification")
+
+# the last workflow
+last_rf_workflow <- 
+  rf_workflow %>% 
+  update_model(last_rf_mod)
+
+# the last fit
+set.seed(345)
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(splits)
+
+last_rf_fit
+```
+
+Note that we added a new argument `importance = "impurity"` to `set_engine` to get variable importance scores. This is an optional, engine-specific argument. To see its documentation, you need to read the documentation for the underlying `ranger()` function. To see it and other options, type `?ranger` in console.
+
+Now let's collect the metrics:
+
+```{r}
+last_rf_fit %>% 
+  collect_metrics()
+```
+
+Now let's `pluck` the workflow and pull out the fit and visualize the variable importance scores for the top 20 features:
+
+```{r}
+last_rf_fit %>% 
+  pluck(".workflow", 1) %>%   
+  pull_workflow_fit() %>% 
+  vip(num_features = 20)
+```
+
+Let's generate our last ROC curve to visualize:
+
+```{r}
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(children, .pred_children) %>% 
+  autoplot()
+```
+
+Not bad!
