@@ -1003,11 +1003,11 @@ Perhaps we would also like to understand what variables are important in this fi
 
 ```{r eval = FALSE}
 # doesn't run, wip packae won't load
-library(vip)
+#library(vip)
 
-final_tree |> 
-  extract_fit_parsnip() |> 
-  vip()
+# final_tree |> 
+#   extract_fit_parsnip() |> 
+#   vip()
 ```
 
 # Case Study
